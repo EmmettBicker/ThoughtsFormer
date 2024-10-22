@@ -29,14 +29,40 @@ class ThoughtsFormerPolicy(ActorCriticPolicy):
         
         # Set up your optimizer
         self.optimizer = self.optimizer_class(self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs)
+        
+    
 
     
     def forward(self, obs: dict):
         assert 'state' in obs and 'thought_step' in obs, f"'state' and 'thought_step' should be keys of the observation dictionary"
         
         logits, values = self.model.forward_ppo_with_tokens(obs['state'], torch.zeros_like(obs['state']), obs['thought_step'])
-        return logits, values
+        sampled_tokens, action_probs = self.sample_tokens(logits)
+       
+        return sampled_tokens, values, action_probs
+    
+    
+    def forward_with_logits(self, obs: dict):
+        assert 'state' in obs and 'thought_step' in obs, f"'state' and 'thought_step' should be keys of the observation dictionary"
+        
+        logits, values = self.model.forward_ppo_with_tokens(obs['state'], torch.zeros_like(obs['state']), obs['thought_step'])
+        sampled_tokens, action_probs = self.sample_tokens(logits)
+       
+        return sampled_tokens, values, action_probs, logits
 
+    def sample_tokens(self, logits: torch.Tensor):
+        log_probs = F.log_softmax(logits, dim=-1)
+        
+        probs = F.softmax(logits, dim = -1)
+        sampled_tokens = torch.multinomial(
+            probs.view(-1, probs.size(-1)),
+            num_samples=1
+        ).view(-1, probs.size(1))
+        
+        action_probs = log_probs.gather(-1, sampled_tokens.unsqueeze(-1)).squeeze(-1)
+        
+        return sampled_tokens, action_probs
+                     
         
     def evaluate_actions(self, obs: dict, actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Sorting! Or really grouping by timestep 
@@ -44,8 +70,9 @@ class ThoughtsFormerPolicy(ActorCriticPolicy):
         thought_steps = obs["thought_step"].flatten()
         batch_size = thought_steps.numel()
         max_sequence_length = self.model.max_context_length // (self.model.max_thought_length + 1)
-        logits = torch.zeros(batch_size, max_sequence_length, self.model.vocab_size).to(thought_steps.device)
+        action_log_probs = torch.zeros(batch_size, max_sequence_length).to(thought_steps.device)
         values = torch.zeros(batch_size, max_sequence_length).to(thought_steps.device)
+        logits = torch.zeros(batch_size, max_sequence_length, self.model.vocab_size).to(thought_steps.device)
         
         for value in torch.unique(thought_steps):
             idxs = torch.where(thought_steps == value.item())[0]
@@ -54,13 +81,10 @@ class ThoughtsFormerPolicy(ActorCriticPolicy):
                 'thought_step' : int(value.item())
             }
             
-            logits[idxs], values[idxs] = self.forward(temp_obs)
-       
-        probs = F.softmax(logits, dim=-1)
+            _, values[idxs], _, logits[idxs] = self.forward_with_logits(temp_obs)
         log_probs = F.log_softmax(logits,dim=-1)
-        
+        probs = F.softmax(logits, dim=-1)
         action_log_probs = log_probs.gather(-1, actions.unsqueeze(-1)).squeeze(-1)
-        
         entropy = -(probs * log_probs).sum(-1) # 
         return values, action_log_probs, entropy
 
@@ -86,7 +110,7 @@ class TokenLevelRolloutBuffer(DictRolloutBuffer):
         self.values = np.zeros_like(self.rewards)
         self.actions = np.zeros_like(self.rewards) 
         self.advantages = np.zeros_like(self.rewards)
-        self.log_probs = np.zeros((self.buffer_size, self.n_envs, self.action_dim))
+        self.log_probs = np.zeros_like(self.rewards)
     def add(  # type: ignore[override]
         self,
         obs: dict[str, np.ndarray],
@@ -125,7 +149,7 @@ class TokenLevelRolloutBuffer(DictRolloutBuffer):
         self.rewards[self.pos] = np.array(reward)
         self.episode_starts[self.pos] = np.array(episode_start)
         self.values[self.pos] = value.clone().cpu().numpy().flatten()
-        self.log_probs[self.pos] = np.array(log_prob) # CHANGE IN EMMETT'S CODE 
+        self.log_probs[self.pos] = log_prob.clone().cpu().numpy() # CHANGE IN EMMETT'S CODE 
         self.pos += 1
         if self.pos == self.buffer_size:
             self.full = True
@@ -352,11 +376,9 @@ class TokenLevelPPO(PPO):
             # Get actions and values from the policy
             with torch.no_grad():
                 obs_tensor = obs_as_tensor(self._last_obs, self.device)
-                log_probs, values = self.policy(obs_tensor)
-            log_probs = log_probs.cpu().numpy()
+                actions, values, log_probs = self.policy(obs_tensor)
+            actions = actions.cpu().numpy()
 
-            # Rescale and perform action
-            clipped_actions = log_probs
 
             if isinstance(self.action_space, spaces.Box):
                 if self.policy.squash_output:
@@ -366,11 +388,11 @@ class TokenLevelPPO(PPO):
                 else:
                     # Otherwise, clip the actions to avoid out of bound error
                     # as we are sampling from an unbounded Gaussian distribution
-                    clipped_actions = np.clip(log_probs, self.action_space.low, self.action_space.high)
+                    clipped_actions = np.clip(actions, self.action_space.low, self.action_space.high)
 
-            new_observations, rewards, dones, infos = env.step(clipped_actions)
+            new_observations, rewards, dones, infos = env.step(actions)
             rewards = torch.stack([infos[idx]['reward'] for idx in range(len(infos))]).numpy()
-            actions = torch.stack([infos[idx]['actions_taken'] for idx in range(len(infos))]).numpy()
+            # actions = torch.stack([infos[idx]['actions_taken'] for idx in range(len(infos))]).numpy()
             
             self.num_timesteps += env.num_envs
             
@@ -436,9 +458,9 @@ class TokenLevelPPO(PPO):
                     # ratio between old and new policy, should be one at the first iteration
                 
                     action_log_prob = action_log_prob.view(-1, actions.shape[1]) # what our policy thinks about the old action taken
-                    old_log_prob = rollout_data.old_log_prob.view(action_log_prob.size(0), actions.shape[1],-1) # what the old policy thinks about the action taken
-                    old_log_prob = F.log_softmax(old_log_prob, dim=-1)
-                    old_log_prob = old_log_prob.gather(-1, actions.unsqueeze(-1)).squeeze(-1) # FIX: Terrible extraction of old log prob for taken actions after the fact and requires storing an outrageous amount of information
+                    old_log_prob = rollout_data.old_log_prob.view(-1, actions.shape[1]) # what the old policy thinks about the action taken
+                    # old_log_prob = F.log_softmax(old_log_prob, dim=-1)
+                    # old_log_prob = old_log_prob.gather(-1, actions.unsqueeze(-1)).squeeze(-1) # FIX: Terrible extraction of old log prob for taken actions after the fact and requires storing an outrageous amount of information
                     ratio = torch.exp(action_log_prob - old_log_prob)
                     
                     current_clip_range = self.clip_range(counter / self._total_timesteps)

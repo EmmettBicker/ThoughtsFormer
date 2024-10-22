@@ -23,8 +23,8 @@ class ThoughtsFormerEnv(Env):
         self.max_context_length = max_sequence_length * (max_thought_length+1)
         
         # Logits
-        self.action_space = spaces.Box(low=-200, high=200, shape=(max_sequence_length,vocab_size), dtype=np.float32)
-
+        self.action_space = spaces.MultiDiscrete([vocab_size] * self.max_sequence_length)
+ 
         
         self.observation_space = spaces.Dict({
             "state" : spaces.MultiDiscrete([vocab_size] * self.max_context_length),
@@ -63,13 +63,8 @@ class ThoughtsFormerEnv(Env):
 
     def step(self, action):
         self.state = self.state.view(1,-1)
+        sampled_tokens = torch.from_numpy(action.reshape(1,-1))
         
-        probs = F.softmax(torch.from_numpy(action), dim = -1)
-        sampled_tokens = torch.multinomial(
-            probs.view(-1, probs.size(-1)),
-            num_samples=1
-        ).view(-1, probs.size(0))
-            
         
         if self.thought_step == self.max_thought_length:
             reward = self.reward(sampled_tokens).flatten() 
@@ -94,7 +89,7 @@ class ThoughtsFormerEnv(Env):
             'thought_step' : self.thought_step
         }
         
-        info = {'reward' : reward, 'actions_taken' : sampled_tokens.squeeze(0)} 
+        info = {'reward' : reward} 
         
         # print(info)
         
@@ -111,8 +106,15 @@ class ThoughtsFormerEnv(Env):
     
 # Check the environment to ensure compatibility
 
+import os
+
+# Set the CUDA_LAUNCH_BLOCKING environment variable to 1
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+
+# Now continue with your script
+
 env = ThoughtsFormerEnv(vocab_size=50257, max_sequence_length=512,max_thought_length=1)
 
-ppo = TokenLevelPPO(ThoughtsFormerPolicy, env, n_steps=4, batch_size=3, max_sequence_length=512, verbose=2)
+ppo = TokenLevelPPO(ThoughtsFormerPolicy, env, n_steps=4, batch_size=4, max_sequence_length=512, verbose=2, ent_coef=0.01)
 
 ppo.learn(1, log_interval=1)

@@ -13,7 +13,7 @@ import math
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from utils import CfgNode as CN
+from archive.utils import CfgNode as CN
 
 # -----------------------------------------------------------------------------
 
