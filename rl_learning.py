@@ -1,11 +1,12 @@
 import torch
-import numpy as np
-from stable_baselines3 import PPO
-from stable_baselines3.common.env_checker import check_env
-from gymnasium import Env, spaces
-from tiny_shakespeare import TinyShakespeareDataset
 import torch.nn.functional as F
+import numpy as np
+from gymnasium import Env, spaces
 import matplotlib.pyplot as plt
+
+from tiny_shakespeare import TinyShakespeareDataset
+from token_level_ppo import TokenLevelPPO, ThoughtsFormerPolicy
+from word_embeddings import get_word_embeddings
 
 def token_batched_reshape_with_offset(x: torch.Tensor, max_seq_length: int, thoughts_taken: int) -> torch.Tensor:
     thoughts = thoughts_taken + 1
@@ -22,7 +23,7 @@ class ThoughtsFormerEnv(Env):
         self.max_context_length = max_sequence_length * (max_thought_length+1)
         
         # Logits
-        self.action_space = spaces.Box(low=-100, high=100, shape=(max_sequence_length,vocab_size), dtype=np.float32)
+        self.action_space = spaces.Box(low=-200, high=200, shape=(max_sequence_length,vocab_size), dtype=np.float32)
 
         
         self.observation_space = spaces.Dict({
@@ -30,16 +31,20 @@ class ThoughtsFormerEnv(Env):
             "thought_step" : spaces.Discrete(max_thought_length+1)
         })
         
+        
+        
         self.dataset = TinyShakespeareDataset(max_sequence_length,window_offset=max_sequence_length//4)
         self.dataset_len = len(self.dataset)
         self.dataset_iter = 0
-        
         self.thought_step = 0
+        
 
     def reset(self, seed=None):
         super().reset(seed=seed)  # Ensures Gymnasium's seeding is properly handled
         
         self.state, self.labels = self.dataset[self.dataset_iter]
+        if self.labels.ndim == 1:
+            self.labels = self.labels.unsqueeze(0)
         self.state = F.pad(self.state, (0,self.max_context_length-self.max_sequence_length))
      
         # prepare self.state and massively elongate
@@ -54,6 +59,7 @@ class ThoughtsFormerEnv(Env):
             'thought_step' : self.thought_step
         }
         return obs, {}
+    
 
     def step(self, action):
         self.state = self.state.view(1,-1)
@@ -66,7 +72,7 @@ class ThoughtsFormerEnv(Env):
             
         
         if self.thought_step == self.max_thought_length:
-            reward = self.reward(action)
+            reward = self.reward(sampled_tokens).flatten() 
             # print(reward.shape)
             done = True
         else:
@@ -82,6 +88,7 @@ class ThoughtsFormerEnv(Env):
             self.state =  self.state.view(1,-1)
         
         self.state = self.state.view(-1)
+        self.thought_step += 1
         obs = {
             'state' : self.state.numpy(),
             'thought_step' : self.thought_step
@@ -90,16 +97,22 @@ class ThoughtsFormerEnv(Env):
         info = {'reward' : reward, 'actions_taken' : sampled_tokens.squeeze(0)} 
         
         # print(info)
-        self.thought_step += 1
+        
         return obs, -np.inf, done, False, info #obs, reward, done, truncated, info
-
-    def reward(self, action):
-        return -F.cross_entropy(torch.tensor(action), self.labels, reduction='none')
+    
+    def reward(self, tokens: torch.Tensor) -> torch.Tensor:
+        a, b = get_word_embeddings(tokens), get_word_embeddings(self.labels)
+        x = F.cosine_similarity(a, b, dim=-1) 
+        x = torch.maximum(x, torch.Tensor([0]))
+        return x.detach()
+    # Encourages greater cosine similarity between tokens.
+    # def reward(self, action):
+    #     return -F.cross_entropy(torch.tensor(action), self.labels, reduction='none')
     
 # Check the environment to ensure compatibility
-from token_level_ppo import TokenLevelPPO, TokenLevelRolloutBuffer, ThoughtsFormerPolicy
+
 env = ThoughtsFormerEnv(vocab_size=50257, max_sequence_length=512,max_thought_length=1)
 
-ppo = TokenLevelPPO(ThoughtsFormerPolicy, env, n_steps=4, batch_size=2, max_sequence_length=512, verbose=2)
-for i in range(3):
-    ppo.learn(4, log_interval=1)
+ppo = TokenLevelPPO(ThoughtsFormerPolicy, env, n_steps=4, batch_size=3, max_sequence_length=512, verbose=2)
+
+ppo.learn(1, log_interval=1)

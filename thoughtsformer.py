@@ -39,6 +39,7 @@ class DualPositionalEncoding(nn.Module):
 
         if not self.disable_thought_encoding:
           self.position_in_thought_encoding = nn.Embedding(max_thought_len+1, self.d_embed)
+          self.position_in_thought_encoding.weight.data.normal_(mean=0.0, std=0.01) # I need to test if this works 
 
     def forward(self, x: torch.Tensor, n_thoughts_taken: int) -> torch.Tensor:
         """
@@ -199,7 +200,7 @@ class NewGELUActivation(nn.Module):
 class CausalTransformer(nn.Module):
     def __init__(self,
                  max_thought_len, 
-                 max_sequence_length, 
+                 max_context_length, 
                  num_layers, 
                  sinusoidal_position_encoding: bool = True,
                  d_embed=768, 
@@ -216,10 +217,11 @@ class CausalTransformer(nn.Module):
                  debug: bool = False
                 ):
         super().__init__()
-        self.max_sequence_length = max_sequence_length
+        self.max_context_length = max_context_length
+        self.max_sequence_length = max_context_length // (max_thought_len + 1)
         self.debug = debug
 
-        self.dual_positional_encoding = DualPositionalEncoding(d_embed, dropout, max_sequence_length, max_thought_len,sinusoidal=sinusoidal_position_encoding)
+        self.dual_positional_encoding = DualPositionalEncoding(d_embed, dropout, max_context_length, max_thought_len,sinusoidal=sinusoidal_position_encoding)
         if device is not None:
           raise NotImplemented("Device parameter being specified has not been implemented. Please use .to() on this module.")
         # device = device
@@ -243,11 +245,11 @@ class CausalTransformer(nn.Module):
                                                  norm=nn.LayerNorm(d_embed))
 
 
-    def generate_thoughtsformer_mask(self, thoughts_taken, real_tokens):
-      assert real_tokens <= self.max_sequence_length, f"Number of real tokens suggested by padding mask is too large. Padding mask shoukd be of size (batch_size x n_real_tokens). Recieved {real_tokens} tokens in padding mask when maximum is {self.max_sequence_length}"
-      main_size = self.max_sequence_length
+    def generate_thoughtsformer_mask(self, thoughts_taken):
+      # assert real_tokens <= self.max_sequence_length, f"Number of real tokens suggested by padding mask is too large. Padding mask shoukd be of size (batch_size x n_real_tokens). Recieved {real_tokens} tokens in padding mask when maximum is {self.max_sequence_length}"
+      main_size = self.max_context_length
       block_size = thoughts_taken + 1
-      n_tokens = real_tokens
+      n_tokens = self.max_context_length // block_size # To get really good debugging where padding tokens are set to 0, remove // block_size
       
       # Create the main tensor and block tensor
       causal_mask = torch.zeros((main_size, main_size))
@@ -265,13 +267,12 @@ class CausalTransformer(nn.Module):
       return causal_mask
 
     def generate_normal_causal_mask(self, *args):
-      return torch.triu(torch.ones(self.max_sequence_length, self.max_sequence_length),diagonal=1)
+      return torch.triu(torch.ones(self.max_context_length, self.max_context_length),diagonal=1)
 
-    def forward(self, x, padding_mask, thoughts_taken, real_token_count):
+    def forward(self, x, padding_mask, thoughts_taken):
       debug_print("embeddings right before positional encodings", x, flag=self.debug)
       x = self.dual_positional_encoding(x, thoughts_taken)
-      torch.save(x,"test.pt")
-      causal_mask = self.generate_thoughtsformer_mask(thoughts_taken,real_token_count).to(x.device)
+      causal_mask = self.generate_thoughtsformer_mask(thoughts_taken).to(x.device)
       debug_print("embeddings right before transformer forward", x, flag=self.debug)
       if self.debug == True:
         plt.imshow(causal_mask)
@@ -299,9 +300,10 @@ class ThoughtsFormer(nn.Module):
 
       self.max_context_length, self.d_embed = max_context_length, d_embed
       self.max_thought_length = max_thought_len
+      self.vocab_size = vocab_size
       self.transformer = CausalTransformer(
         max_thought_len=max_thought_len, 
-        max_sequence_length=max_context_length, 
+        max_context_length=max_context_length, 
         num_layers=num_layers, 
         sinusoidal_position_encoding=sinusoidal_position_encoding, 
         d_embed=d_embed,
@@ -353,13 +355,11 @@ class ThoughtsFormer(nn.Module):
     state_embeddings = self.prepare_thoughtsformer_embedding_input(state_embeddings)
     
     padding_mask = self.prepare_thoughtsformer_padding_mask_input(padding_mask)
-    
-    self.token_positions = torch.where(padding_mask == False)[1]
+
     # print(torch.sum(padding_mask == 0,dim=1))
     # print( int(torch.sum(padding_mask == 0,dim=1).max()))
-    self.n_real_tokens = int(torch.sum(padding_mask == 0,dim=1).max())
-    debug_print("original embeddings \n", state_embeddings, flag=self.debug)
-    next_embeddings = self.transformer(state_embeddings, padding_mask, n_thoughts_taken, self.n_real_tokens)
+
+    next_embeddings = self.transformer(state_embeddings, padding_mask, n_thoughts_taken)
     debug_print("future embeddings\n", next_embeddings,  flag=self.debug)
     action_embeddings = self.get_tokens_at_action_location(next_embeddings, n_thoughts_taken)
     
@@ -464,8 +464,6 @@ class ThoughtsFormer(nn.Module):
     debug_print(final_embeds.shape, seq_len, n_element_next, flag=self.debug)
     padding = torch.zeros(final_embeds.size(0), seq_len-n_element_next, final_embeds.size(2))
     final_embeds = torch.cat((final_embeds, padding),dim=1)
-
-    self.token_positions = self.get_next_token_count(self.token_positions)
 
     return final_embeds
 

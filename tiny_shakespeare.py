@@ -1,6 +1,7 @@
 from datasets import load_dataset
 from transformers import GPT2Tokenizer
 import torch
+import random
 from torch.utils.data import Dataset
 
 class TinyShakespeareDataset(Dataset):
@@ -23,3 +24,6 @@ class TinyShakespeareDataset(Dataset):
         end = start + self.token_window_size + 1
         
         return self.tokens[start:end-1], self.tokens[start+1:end]
+    
+    def shuffle(self):
+        random.shuffle(self.indices)

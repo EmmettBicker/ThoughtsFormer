@@ -1,4 +1,5 @@
 
+import warnings
 from stable_baselines3 import PPO
 from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.buffers import DictRolloutBuffer
@@ -38,7 +39,23 @@ class ThoughtsFormerPolicy(ActorCriticPolicy):
 
         
     def evaluate_actions(self, obs: dict, actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        logits, values = self.forward(obs)
+        # Sorting! Or really grouping by timestep 
+        
+        thought_steps = obs["thought_step"].flatten()
+        batch_size = thought_steps.numel()
+        max_sequence_length = self.model.max_context_length // (self.model.max_thought_length + 1)
+        logits = torch.zeros(batch_size, max_sequence_length, self.model.vocab_size).to(thought_steps.device)
+        values = torch.zeros(batch_size, max_sequence_length).to(thought_steps.device)
+        
+        for value in torch.unique(thought_steps):
+            idxs = torch.where(thought_steps == value.item())[0]
+            temp_obs = {
+                'state' : obs['state'][idxs],
+                'thought_step' : int(value.item())
+            }
+            
+            logits[idxs], values[idxs] = self.forward(temp_obs)
+       
         probs = F.softmax(logits, dim=-1)
         log_probs = F.log_softmax(logits,dim=-1)
         
@@ -46,6 +63,8 @@ class ThoughtsFormerPolicy(ActorCriticPolicy):
         
         entropy = -(probs * log_probs).sum(-1) # 
         return values, action_log_probs, entropy
+
+
 
     def _get_action_dist_from_obs(self, obs):
         return self.model.forward_ppo_with_tokens(obs['state'], torch.zeros_like(obs['state']), obs['thought_step'])[0]
@@ -396,50 +415,56 @@ class TokenLevelPPO(PPO):
         for epoch in range(self.n_epochs):
             for rollout_data in self.rollout_buffer.get(self.batch_size):
                 
-                
-                actions = rollout_data.actions
-                actions = actions.reshape(actions.size(0), self.max_sequence_length).to(torch.long)
-                # actions = actions.reshape(actions.size(0),self.
-                rollout_data.observations['state'] = rollout_data.observations['state'].to(torch.long)
-                rollout_data.observations['thought_step'] = int(rollout_data.observations['thought_step'][0].item())
-                values, action_log_prob, entropy = self.policy.evaluate_actions(rollout_data.observations, actions)
+                with torch.autograd.set_detect_anomaly(True):
+                    actions = rollout_data.actions
+                    actions = actions.reshape(actions.size(0), self.max_sequence_length).to(torch.long)
+                    # actions = actions.reshape(actions.size(0),self.
+                    rollout_data.observations['state'] = rollout_data.observations['state'].to(torch.long)
+                    # rollout_data.observations['thought_step'] 
+                    values, action_log_prob, entropy = self.policy.evaluate_actions(rollout_data.observations, actions)
 
-                values = values.view(-1, actions.shape[1]) # (batch x tokens)
-                # Normalize advantage
-                advantages = rollout_data.advantages
-                advantages = advantages.view(-1, actions.shape[1]) # (batch x tokens)
-                advantages = (advantages - advantages.mean(dim=0, keepdim=True)) / (advantages.std(dim=0, keepdim=True) + 1e-8)
-                
-                # ratio between old and new policy, should be one at the first iteration
-               
-                action_log_prob = action_log_prob.view(-1, actions.shape[1]) # what our policy thinks about the old action taken
-                old_log_prob = rollout_data.old_log_prob.view(action_log_prob.size(0), actions.shape[1],-1) # what the old policy thinks about the action taken
-                old_log_prob = F.log_softmax(old_log_prob, dim=-1)
-                old_log_prob = old_log_prob.gather(-1, actions.unsqueeze(-1)).squeeze(-1) # FIX: Terrible extraction of old log prob for taken actions after the fact and requires storing an outrageous amount of information
-                ratio = torch.exp(action_log_prob - old_log_prob)
-                
-                current_clip_range = self.clip_range(counter / self._total_timesteps)
-                # clipped surrogate loss
-                policy_loss_1 = advantages * ratio
-                policy_loss_2 = advantages * torch.clamp(ratio, 1 - current_clip_range, 1 + current_clip_range)
-                policy_loss = -torch.min(policy_loss_1, policy_loss_2)
+                    values = values.view(-1, actions.shape[1]) # (batch x tokens)
+                    # Normalize advantage
+                    advantages = rollout_data.advantages
+                    advantages = advantages.view(-1, actions.shape[1]) # (batch x tokens)
+                    if advantages.size(0) >= 3: # Only normalize if there's a sizable batch
+                        advantages = (advantages - advantages.mean(dim=0, keepdim=True)) / (advantages.std(dim=0, keepdim=True) + 1e-8)
+                    else:
+                        warnings.warn("Size of current batch is less than or equal to two, so advantage batch normalization has been disabled this iteration.")
 
+                    
+                    # ratio between old and new policy, should be one at the first iteration
                 
-                # Value clipping is omitted in the token-based version, but could be added if needed
-                value_loss = F.mse_loss(rollout_data.returns.view(-1, actions.shape[1]), values, reduction='none')
-                # Value loss using the TD(gae_lambda) target
+                    action_log_prob = action_log_prob.view(-1, actions.shape[1]) # what our policy thinks about the old action taken
+                    old_log_prob = rollout_data.old_log_prob.view(action_log_prob.size(0), actions.shape[1],-1) # what the old policy thinks about the action taken
+                    old_log_prob = F.log_softmax(old_log_prob, dim=-1)
+                    old_log_prob = old_log_prob.gather(-1, actions.unsqueeze(-1)).squeeze(-1) # FIX: Terrible extraction of old log prob for taken actions after the fact and requires storing an outrageous amount of information
+                    ratio = torch.exp(action_log_prob - old_log_prob)
+                    
+                    current_clip_range = self.clip_range(counter / self._total_timesteps)
+                    # clipped surrogate loss
+                    policy_loss_1 = advantages * ratio
+                    policy_loss_2 = advantages * torch.clamp(ratio, 1 - current_clip_range, 1 + current_clip_range)
+                    policy_loss = -torch.min(policy_loss_1, policy_loss_2)
 
-                # Entropy loss favor exploration
-                if entropy is None:
-                    entropy_loss = -action_log_prob
-                else:
-                    entropy_loss = -entropy.view(-1, actions.shape[1])
+                    
+                    # Value clipping is omitted in the token-based version, but could be added if needed
+                    value_loss = F.mse_loss(rollout_data.returns.view(-1, actions.shape[1]), values, reduction='none')
+                    # Value loss using the TD(gae_lambda) target
 
-                token_loss = policy_loss + self.vf_coef * value_loss + self.ent_coef * entropy_loss
-                loss = token_loss.mean()
+                    # Entropy loss favor exploration
+                    if entropy is None:
+                        entropy_loss = -action_log_prob
+                    else:
+                        entropy_loss = -entropy.view(-1, actions.shape[1])
+
+                    token_loss = policy_loss + self.vf_coef * value_loss + self.ent_coef * entropy_loss
+                    loss = token_loss.mean()
+                    
+                    self.policy.optimizer.zero_grad()
                 
-                self.policy.optimizer.zero_grad()
-                loss.backward()
+                    loss.backward()
+                # .backward()
                 # Clip grad norm
                 torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
                 self.policy.optimizer.step()
@@ -448,7 +473,7 @@ class TokenLevelPPO(PPO):
                 counter+=1
             
                 self.logger.record("train/loss", loss.item())
-                self.logger.record("train/policy_loss", policy_loss.abs().mean().item())
+                self.logger.record("train/policy_loss", policy_loss.mean().item())
                 self.logger.record("train/value_loss", value_loss.mean().item())
                 self.logger.record("train/entropy_loss", entropy_loss.mean().item())
                 self.logger.record("train/mean_reward", rollout_data.returns.mean().item())
