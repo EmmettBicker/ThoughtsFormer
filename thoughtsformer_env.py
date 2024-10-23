@@ -105,14 +105,4 @@ class ThoughtsFormerEnv(Env):
     #     return -F.cross_entropy(torch.tensor(action), self.labels, reduction='none')
 
 
-n_thoughts = 3
-seq_len = 1024 // (n_thoughts+1)
 
-env = ThoughtsFormerEnv(vocab_size=50257, max_sequence_length=seq_len,max_thought_length=n_thoughts)
-policy_kwargs = {
-    "max_thought_len" : n_thoughts,
-    "from_gpt2" : True
-}
-ppo = TokenLevelPPO(ThoughtsFormerPolicy, env, n_steps=128, batch_size=16, max_sequence_length=seq_len, verbose=2, ent_coef=0.001, policy_kwargs=policy_kwargs)
-
-ppo.learn(6000)
