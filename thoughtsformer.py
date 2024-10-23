@@ -1,11 +1,11 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import BertTokenizer, BertModel
-import matplotlib.pyplot as plt
-from enum import Enum 
-from typing import Type
 
+import math
+import matplotlib.pyplot as plt
+from typing import Type, Callable
+from dual_positional_encoding import DualPositionalEncoding
 
 MAX_SEQUENCE_LENGTH = 512
 
@@ -15,333 +15,235 @@ def debug_print(*args, flag=False, **kwargs):
     if flag:
         print(*args, **kwargs)
 
-# A modified version of pytorch's positional encoding implementaiton
-class DualPositionalEncoding(nn.Module):
 
-    def __init__(self, d_model: int, dropout: float = 0.1, context_len: int = 512, max_thought_len: int = 4, disable_thought_encodings_if_thought_len_is_zero: bool = True, sinusoidal=True):
-        super().__init__()
-        self.dropout = nn.Dropout(p=dropout)
-        self.d_embed = d_model
-      
-        max_len = context_len // (max_thought_len + 1)
-        position = torch.arange(max_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2) * (-torch.math.log(10000.0) / d_model))
-        if sinusoidal == True:
-          sinusoidal_positional_encoding = torch.zeros(1, max_len, d_model)
-          sinusoidal_positional_encoding[0, :, 0::2] = torch.sin(position * div_term)
-          sinusoidal_positional_encoding[0, :, 1::2] = torch.cos(position * div_term)
-          self.register_buffer('pe', sinusoidal_positional_encoding)
-        else:
-          self.learned_positional_encoding = nn.Embedding(max_len, self.d_embed)
-        self.sinusoidal = sinusoidal
-        self.max_len, self.max_thought_len, self.context_len = max_len, max_thought_len, context_len
-        self.disable_thought_encoding = disable_thought_encodings_if_thought_len_is_zero and max_thought_len == 0
-
-        if not self.disable_thought_encoding:
-          self.position_in_thought_encoding = nn.Embedding(max_thought_len+1, self.d_embed)
-          self.position_in_thought_encoding.weight.data.normal_(mean=0.0, std=0.01) # I need to test if this works 
-
-    def forward(self, x: torch.Tensor, n_thoughts_taken: int) -> torch.Tensor:
-        """
-        Arguments:
-            x: Tensor, shape ``[batch_size, seq_len, embedding_dim]``
-        """
-        # plt.imshow(x[0,:,:].detach().numpy())
-        # plt.show()
-        x = simple_batched_reshape_with_offset(x, max_seq_length=self.max_len, thoughts_taken=n_thoughts_taken)
-        # print(x.shape)
-        if self.sinusoidal:
-          x = x + self.pe.unsqueeze(2)
-        else:
-          x = x + self.learned_positional_encoding(torch.arange(self.max_len).to(x.device)).unsqueeze(0).unsqueeze(2)
-          
-        if not self.disable_thought_encoding:
-          x = x + self.position_in_thought_encoding(torch.arange( self.max_thought_len + 1).to(x.device)).unsqueeze(0).unsqueeze(0)
-        # plt.title("X on the token positional encodings")
-        # plt.imshow(x[0,:,0,:].detach().numpy())
-        # plt.show()
-        # plt.title("X on the token positional encodings")
-        # plt.imshow(x[0,:,1,:].detach().numpy())
-        # plt.show()
-        # plt.title("X on the thought position encodings")
-        # plt.imshow(x[0,0,:,:].detach().numpy())
-        # plt.show()
-        # Reshape and pad back to original size
-        x = inverse_simple_batched_reshape_with_offset(x,thoughts_taken=n_thoughts_taken)
-
-        # plt.imshow(x[0,:,:].detach().numpy())
-        # plt.show()
-        # print(x.shape)
-        # padding_size = self.max_len - (real_token_count * n_thoughts_taken)
-        # print(x.shape)
-        # if padding_size > 0:
-        #     x = F.pad(x, (0, 0, 0, padding_size), mode='constant', value=0)
-        # print(x.shape)
-        return self.dropout(x)
-
-import math
-
-def simple_batched_reshape_with_offset(x: torch.Tensor, max_seq_length: int, thoughts_taken: int) -> torch.Tensor:
-    thoughts = thoughts_taken + 1
-    max_thoughts = x.size(1) // max_seq_length
-    x = x[:,:max_seq_length*thoughts,:].view(x.size(0), max_seq_length, thoughts, x.size(2))
-    return F.pad(x,(0,0, 0, (max_thoughts - thoughts)))
-
-
-def inverse_simple_batched_reshape_with_offset(x: torch.Tensor, thoughts_taken: int) -> torch.Tensor:
-  seq_len, max_thoughts = x.size(1), x.size(2)
-  x = x[:,:,:thoughts_taken+1,:].view(x.size(0), -1 ,x.size(3))
-  x = F.pad(x,(0,0,0, seq_len * (max_thoughts - (thoughts_taken+1))))
-  return x
-
-
-# Manual implementation of attention because of weird inconsistencies in pytorch's built in version
 class _NanAwareTransformerEncoderLayer(nn.TransformerEncoderLayer):
-    def forward(self, src, src_mask=None, src_key_padding_mask=None, is_causal=False):
-        # print("Input to layer:", src)
-        
-        # Extract W_q, W_k, W_v, and biases
-        with torch.no_grad():
-            W = self.self_attn.in_proj_weight.to(torch.float64)
-            b = self.self_attn.in_proj_bias.to(torch.float64)
-            E = self.self_attn.embed_dim  # Total embedding size
-            H = self.self_attn.num_heads  # Number of attention heads
+  '''
+  Implentation of <code>nn.TransformerEncoderLayer</code> that zeros all nans
+  after execution. Nans should not be encountered in training when causal mask
+  includes padding tokens.
+  '''
+  def __init__(self, *args, **kwargs):
+      super().__init__(*args, **kwargs)
 
-            # Split weights for multi-head projections
-            W_q, W_k, W_v = W[:E], W[E:2*E], W[2*E:]
-            b_q, b_k, b_v = b[:E], b[E:2*E], b[2*E:]
-
-        # Convert input to float64 for precision
-        src_64 = src.to(torch.float64)
-        batch_size, seq_len, embed_dim = src_64.size()
-
-        # Compute Q, K, V with multiple heads
-        def reshape_for_heads(x):
-            """Reshape to (batch_size, num_heads, seq_len, head_dim)."""
-            return x.view(batch_size, seq_len, H, embed_dim // H).transpose(1, 2)
-
-        q = reshape_for_heads(torch.matmul(src_64, W_q.T) + b_q)
-        k = reshape_for_heads(torch.matmul(src_64, W_k.T) + b_k)
-        v = reshape_for_heads(torch.matmul(src_64, W_v.T) + b_v)
-
-        # print("Q:", q)
-        # print("K:", k)
-        # print("V:", v)
-
-        # Compute scaled dot-product attention for each head: (QK^T) / sqrt(d_k)
-        d_k = q.size(-1)  # Head dimension
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / torch.sqrt(torch.tensor(d_k, dtype=torch.float64))
-
-        # Apply the optional mask
-        if src_mask is not None:
-            attn_scores += src_mask.to(torch.float64)
-
-        # print("Pre-softmax attention scores:", attn_scores)
-
-        # Apply softmax to get attention weights
-        attn_weights = F.softmax(attn_scores, dim=-1)
-        # print("Post-softmax attention weights:", attn_weights)
-
-        # Multiply attention weights with V
-        attn_output = torch.matmul(attn_weights, v)  # (batch_size, num_heads, seq_len, head_dim)
-        # print("Attention output (before reshaping):", attn_output)
-
-        # Reshape back to (batch_size, seq_len, embed_dim)
-        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, embed_dim)
-        # print("Attention output (after reshaping):", attn_output)
-
-        # Residual connection and dropout
-        src = src + self.dropout1(attn_output.to(src.dtype))
-        # print("After dropout and residual connection:", src)
-
-        # Apply layer normalization
-        src = self.norm1(src)
-        # print("After first layer norm:", src)
-
-        # Feedforward block
-        src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
-        # print("After feed-forward network:", src2)
-
-        # Another residual connection and dropout
-        src = src + self.dropout2(src2)
-        # print("After dropout and second residual connection:", src)
-
-        # Final layer normalization
-        src = self.norm2(src)
-        # print("After second layer norm:", src)
-
-        # Handle NaN values by replacing them with 0
-        output = torch.nan_to_num(src, nan=0.0)
-        # print("Final output after NaN handling:", output)
-
-        return output
-
-# Normal version that's much faster but doesn't have the same theoretical soundness as previous version
-class _FasterNanAwareTransformerEncoderLayer(nn.TransformerEncoderLayer):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-    def forward(self, *args, **kwargs):
-        # print("before: ", args[0])
-        output = super().forward(*args, **kwargs)
-        # print("after: ", output)
-        return torch.where(torch.isnan(output), torch.zeros_like(output), output)
+  def forward(self, *args, **kwargs):
+      # print("before: ", args[0])
+      output = super().forward(*args, **kwargs)
+      # print("after: ", output)
+      return torch.where(torch.isnan(output), torch.zeros_like(output), output)
 
 class NewGELUActivation(nn.Module):
     """
     Implementation of the GELU activation function currently in Google BERT repo (identical to OpenAI GPT). Also see
     the Gaussian Error Linear Units paper: https://arxiv.org/abs/1606.08415
+    
+    Copied from huggingface transformers library
     """
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         return 0.5 * input * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (input + 0.044715 * torch.pow(input, 3.0))))
 
 
-class CausalTransformer(nn.Module):
-    def __init__(self,
-                 max_thought_len, 
-                 max_context_length, 
-                 num_layers, 
-                 sinusoidal_position_encoding: bool = True,
-                 d_embed=768, 
-                 n_head=8, 
-                 dim_feedforward=2048, 
-                 dropout=0.1, 
-                 activation=F.gelu, # Different from usual default
-                 layer_norm_eps: float = 0.0001,
-                 batch_first: bool = True, # Different from usual default
-                 norm_first: bool = True, # Different from usual default
-                 bias: bool = True,
-                 device = None,
-                 dtype = None,
-                 debug: bool = False
-                ):
-        super().__init__()
-        self.max_context_length = max_context_length
-        self.max_sequence_length = max_context_length // (max_thought_len + 1)
-        self.debug = debug
-
-        self.dual_positional_encoding = DualPositionalEncoding(d_embed, dropout, max_context_length, max_thought_len,sinusoidal=sinusoidal_position_encoding)
-        if device is not None:
-          raise NotImplemented("Device parameter being specified has not been implemented. Please use .to() on this module.")
-        # device = device
-        layer = _FasterNanAwareTransformerEncoderLayer(
-            d_model=d_embed,
-            nhead = n_head,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            activation=activation,
-            layer_norm_eps=layer_norm_eps,
-            batch_first=batch_first,
-            norm_first=norm_first,
-            bias=bias,
-            # device = device  || not implemented because I don't know if it will it in with the rest of my calculations
-            dtype=dtype
-        )
-        # nn.TransformerEncoderLayer())
-    
-        self.transformer = nn.TransformerEncoder(encoder_layer=layer,
-                                                 num_layers=num_layers,
-                                                 norm=nn.LayerNorm(d_embed))
-
-
-    def generate_thoughtsformer_mask(self, thoughts_taken):
-      # assert real_tokens <= self.max_sequence_length, f"Number of real tokens suggested by padding mask is too large. Padding mask shoukd be of size (batch_size x n_real_tokens). Recieved {real_tokens} tokens in padding mask when maximum is {self.max_sequence_length}"
-      main_size = self.max_context_length
-      block_size = thoughts_taken + 1
-      n_tokens = self.max_context_length // block_size # To get really good debugging where padding tokens are set to 0, remove // block_size
-      
-      # Create the main tensor and block tensor
-      causal_mask = torch.zeros((main_size, main_size))
-      block_for_thought_sequence = torch.triu(torch.ones(block_size,block_size),diagonal=0)
-
-      # List of starting indices for the diagonal blocks
-      block_starting_idxs = torch.arange(n_tokens) * block_size
-
-      for idx in block_starting_idxs:
-          causal_mask[idx:idx+block_size, idx:idx+block_size] = block_for_thought_sequence
-          causal_mask[idx, idx+1:n_tokens*block_size] = 1
+class ThoughtCausalTransformer(nn.Module):
+  '''
   
-      causal_mask = causal_mask.T == 0
+  '''
+  def __init__(self,
+                max_thought_len, 
+                max_context_length, 
+                num_layers, 
+                sinusoidal_position_encoding: bool = True,
+                d_embed=768, 
+                n_head=8, 
+                dim_feedforward=2048, 
+                dropout=0.1, 
+                activation=F.gelu, # Different from usual default
+                layer_norm_eps: float = 0.0001,
+                batch_first: bool = True, # Different from usual default
+                norm_first: bool = True, # Different from usual default
+                bias: bool = True,
+                device = None,
+                dtype = None,
+                debug: bool = False
+              ):
+    super().__init__()
+    self.max_context_length = max_context_length
+    self.max_sequence_length = max_context_length // (max_thought_len + 1)
+    self.debug = debug
 
-      return causal_mask
+    self.dual_positional_encoding = DualPositionalEncoding(d_embed, dropout, max_context_length, max_thought_len,sinusoidal=sinusoidal_position_encoding)
+    if device is not None:
+      raise NotImplemented("Device parameter being specified has not been implemented. Please use .to() on this module.")
+    # device = device
+    layer = _NanAwareTransformerEncoderLayer(
+        d_model=d_embed,
+        nhead = n_head,
+        dim_feedforward=dim_feedforward,
+        dropout=dropout,
+        activation=activation,
+        layer_norm_eps=layer_norm_eps,
+        batch_first=batch_first,
+        norm_first=norm_first,
+        bias=bias,
+        # device = device  || not implemented because I don't know if it will it in with the rest of my calculations
+        dtype=dtype
+    )
+    # nn.TransformerEncoderLayer())
 
-    def generate_normal_causal_mask(self, *args):
-      return torch.triu(torch.ones(self.max_context_length, self.max_context_length),diagonal=1)
+    self.transformer = nn.TransformerEncoder(encoder_layer=layer,
+                                              num_layers=num_layers,
+                                              norm=nn.LayerNorm(d_embed))
 
-    def forward(self, x, padding_mask, thoughts_taken):
-      debug_print("embeddings right before positional encodings", x, flag=self.debug)
-      x = self.dual_positional_encoding(x, thoughts_taken)
-      causal_mask = self.generate_thoughtsformer_mask(thoughts_taken).to(x.device)
-      debug_print("embeddings right before transformer forward", x, flag=self.debug)
-      if self.debug == True:
-        plt.imshow(causal_mask)
-        plt.show()
-      x = self.transformer(x, mask=causal_mask, src_key_padding_mask=padding_mask)
-      debug_print("embeddings right after transformer forward", x, flag=self.debug)
-      return x
+
+  def generate_thoughtsformer_mask(self, thoughts_taken: int) -> torch.Tensor:
+    '''
+    Generates a causal mask where thoughts are invisible to all other tokens 
+    except for tokens later in the same train of thought.
+    '''
+    main_size = self.max_context_length
+    block_size = thoughts_taken + 1
+    n_tokens = self.max_context_length // block_size # To get really good debugging where padding tokens are set to 0, remove // block_size
+    
+    # Has ones on the diagonal to avoid nan issues where a value is never attended to
+    causal_mask = torch.eye(main_size)
+    block_for_thought_sequence = torch.triu(torch.ones(block_size,block_size),diagonal=0)
+
+    # List of starting indices for the diagonal blocks
+    block_starting_idxs = torch.arange(n_tokens) * block_size
+
+    for idx in block_starting_idxs:
+        causal_mask[idx:idx+block_size, idx:idx+block_size] = block_for_thought_sequence
+        causal_mask[idx, idx+1:n_tokens*block_size] = 1
+
+    causal_mask = causal_mask.T == 0
+
+    return causal_mask
+
+  def forward(self, x, padding_mask, thoughts_taken):
+    '''
+    Forward method of a thoughtsformer that makes thoughts invisible to all
+    other tokens except for tokens later in the same train of thought. 
+    '''
+    debug_print("embeddings right before positional encodings", x, flag=self.debug)
+    x = self.dual_positional_encoding(x, thoughts_taken)
+    causal_mask = self.generate_thoughtsformer_mask(thoughts_taken).to(x.device)
+    debug_print("embeddings right before transformer forward", x, flag=self.debug)
+    if self.debug == True:
+      plt.imshow(causal_mask)
+      plt.show()
+    x = self.transformer(x, mask=causal_mask, src_key_padding_mask=padding_mask)
+    debug_print("embeddings right after transformer forward", x, flag=self.debug)
+    return x
 
 
 
 
 class ThoughtsFormer(nn.Module):
-  def __init__(self, max_thought_len, vocab_size, max_context_length=None,max_sequence_length=None, sinusoidal_position_encoding=True,num_layers=8, n_head=8, d_embed=768, dim_feedforward=2048, dropout=0.1, activation=F.gelu, layer_norm_eps=0.0001, batch_first=True, norm_first=True, bias=True, device=None, dtype=None, verbose=False):
-      super().__init__()
-      
-      if max_context_length is None and max_sequence_length is None:
-        raise ValueError("Must specify either max_context_length or max_sequence_length")
-      elif max_context_length is None: # and max_context_length is not None
-        max_context_length = max_sequence_length * (max_thought_len + 1) # If max_context_length is 20, and one thought is allowed, then it should be 
-      
-      if max_context_length is None:
-        raise RuntimeError("Max context length undefined--unreachable code reached")
-      if device is not None:
-          raise NotImplemented("Device parameter being specified has not been implemented. Please use .to() on this module.")
+  '''
+  Model architecture that generates <code>max_thought_len</code> tokens before predicting the
+  next token. 
+  '''
+  def __init__(self, 
+               max_thought_len: int,
+               vocab_size: int, 
+               max_context_length: int = None,
+               max_sequence_length: int = None, 
+               sinusoidal_position_encoding: bool = False,
+               num_layers: int = 8, 
+               n_head: int = 8, 
+               d_embed: int = 768, 
+               dim_feedforward: int = 2048, 
+               dropout: int = 0.1, 
+               activation: Callable[[torch.Tensor], torch.Tensor] = F.gelu, 
+               layer_norm_eps: float = 0.0001, 
+               batch_first: bool = True, 
+               norm_first: bool = True, 
+               bias: bool = True, 
+               verbose: bool = False
+              ):
+    '''Initalization method of the ThoughtsFormer
 
-      self.max_context_length, self.d_embed = max_context_length, d_embed
-      self.max_thought_length = max_thought_len
-      self.vocab_size = vocab_size
-      self.transformer = CausalTransformer(
-        max_thought_len=max_thought_len, 
-        max_context_length=max_context_length, 
-        num_layers=num_layers, 
-        sinusoidal_position_encoding=sinusoidal_position_encoding, 
-        d_embed=d_embed,
-        n_head=n_head, 
-        dim_feedforward=dim_feedforward, 
-        dropout=dropout,
-        activation=activation,
-        layer_norm_eps=layer_norm_eps,
-        batch_first=batch_first, # Different from usual default
-        norm_first=norm_first, # Different from usual default
-        bias=bias,
-        device=device,
-        dtype=dtype,
-        debug=verbose
-        )
-      
-      
-      # self.policy_feedforward = nn.Sequential(
-      #   nn.Linear(d_embed, d_embed),
-      #   nn.GELU(),
-      #   nn.Linear(d_embed, vocab_size)
-      # )
-      
-      self.policy_feedforward = nn.Linear(d_embed, vocab_size,bias=False)
-      # Weird difference between the two but GPT2 uses the single head for the feedforward head and I want to do the weight transfer entirely but allow extra modularity for the value function
-      self.value_feedforward = nn.Sequential(
-        nn.Linear(d_embed, dim_feedforward),
-        nn.GELU(),
-        nn.Linear(dim_feedforward, 1)
+    Args:
+        max_thought_len (int): The maximum length of any train of thought. Set to 0 to function as a normal transformer
+        vocab_size (int): vocab_size
+        max_context_length (int, optional): The maximum context length of the model. Must specify this or specify max_sequence_length because max_sequence_length * (max_thought_len + 1) is equal to max_context_length. Defaults to None.
+        max_sequence_length (int, optional): The maximum sequence length of the model. Must specify this or specify max_context_length because max_sequence_length * (max_thought_len + 1) is equal to max_context_length. Defaults to None.
+        sinusoidal_position_encoding (bool, optional): Whether or not to use sinusoidal or learned positional encodings. Positional encodings are 2D, for position in thought and position in sequence; thought encodings will always be learned, this parameter specifies if position in sequence tokens are sinusoidal. Defaults to False.
+        num_layers (int, optional): Unchanged transformer parameter. Defaults to 8.
+        n_head (int, optional): Unchanged transformer parameter. Defaults to 8.
+        d_embed (int, optional): Unchanged transformer parameter. Defaults to 768.
+        dim_feedforward (int, optional): Unchanged transformer parameter. Defaults to 2048.
+        dropout (int, optional): Unchanged transformer parameter. Defaults to 0.1.
+        activation (Callable[[torch.Tensor], torch.Tensor], optional): Unchanged transformer parameter. Defaults to F.gelu.
+        layer_norm_eps (float, optional): Unchanged transformer parameter. Defaults to 0.0001.
+        batch_first (bool, optional): Unchanged transformer parameter. Defaults to True.
+        norm_first (bool, optional): Unchanged transformer parameter. Defaults to True.
+        bias (bool, optional): Unchanged transformer parameter. Defaults to True.
+        verbose (bool, optional): _description_. Defaults to False.
+
+    Raises:
+        ValueError: Raises a ValueError if max_context_length and max_sequence_length are not specified, or if both are passed in with conflicting values
+        RuntimeError: For unreachable code.
+    '''
+
+    super().__init__()
+    
+    if max_context_length is None and max_sequence_length is None:
+      raise ValueError("Must specify either max_context_length or max_sequence_length")
+    elif not max_context_length is None and not max_sequence_length is None and max_context_length != max_sequence_length * (max_thought_len + 1):
+      raise ValueError(f"Error in maximum context length and maximum sequence length specifications. The maximum context length must be equal to max_sequence_length * (max_thought_length + 1), but in the input max_context_length is {max_context_length} and max_sequence_length * (max_thought_len + 1) is { max_sequence_length * (max_thought_len + 1)}")
+    elif max_context_length is None: 
+      max_context_length = max_sequence_length * (max_thought_len + 1) 
+    
+    
+    if max_context_length is None:
+      raise RuntimeError("Max context length undefined--unreachable code reached")
+
+    if max_context_length % (max_thought_len+1) != 0:
+      raise NotImplementedError("Number of thoughts + 1 currently must evenly divide into max_context_length")
+
+    self.max_context_length, self.d_embed = max_context_length, d_embed
+    self.max_thought_length = max_thought_len
+    self.max_sequence_length = self.max_context_length // (self.max_thought_length + 1)
+    self.vocab_size = vocab_size
+    self.transformer = ThoughtCausalTransformer(
+      max_thought_len=max_thought_len, 
+      max_context_length=max_context_length, 
+      num_layers=num_layers, 
+      sinusoidal_position_encoding=sinusoidal_position_encoding, 
+      d_embed=d_embed,
+      n_head=n_head, 
+      dim_feedforward=dim_feedforward, 
+      dropout=dropout,
+      activation=activation,
+      layer_norm_eps=layer_norm_eps,
+      batch_first=batch_first, # Different from usual default
+      norm_first=norm_first, # Different from usual default
+      bias=bias,
+      debug=verbose
       )
-      self.token_embedding = nn.Embedding(vocab_size, d_embed)
-      
-      self.debug = verbose
+    
+    
+    # self.policy_feedforward = nn.Sequential(
+    #   nn.Linear(d_embed, d_embed),
+    #   nn.GELU(),
+    #   nn.Linear(d_embed, vocab_size)
+    # )
+    
+    self.policy_feedforward = nn.Linear(d_embed, vocab_size,bias=False)
+    # Weird difference between the two but GPT2 uses the single head for the feedforward head and I want to do the weight transfer entirely but allow extra modularity for the value function
+    self.value_feedforward = nn.Sequential(
+      nn.Linear(d_embed, dim_feedforward),
+      nn.GELU(),
+      nn.Linear(dim_feedforward, 1)
+    )
+    self.token_embedding = nn.Embedding(vocab_size, d_embed)
+    
+    self.debug = verbose
 
   
   def forward_ppo(self, state_embeddings: torch.Tensor, padding_mask: torch.Tensor, n_thoughts_taken: int | torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     '''
-    Takes in the current state and the padding mask, outputs the logits for the next action and value for every token in the sequence
+    Takes in the current state, the padding mask, and the number of thoughts already taken. Outputs the logits for the next action and value for every token in the sequence. 
     '''
     if type(n_thoughts_taken) == torch.Tensor and n_thoughts_taken.numel() == 1:
       n_thoughts_taken: int  = n_thoughts_taken.item()
@@ -354,7 +256,7 @@ class ThoughtsFormer(nn.Module):
     
     state_embeddings = self.prepare_thoughtsformer_embedding_input(state_embeddings)
     
-    padding_mask = self.prepare_thoughtsformer_padding_mask_input(padding_mask)
+    padding_mask = self._prepare_thoughtsformer_padding_mask_input(padding_mask)
 
     # print(torch.sum(padding_mask == 0,dim=1))
     # print( int(torch.sum(padding_mask == 0,dim=1).max()))
@@ -368,7 +270,10 @@ class ThoughtsFormer(nn.Module):
   # Claude's version for tokens!
   def forward_ppo_with_tokens(self, tokens: torch.Tensor, padding_mask: torch.Tensor, n_thoughts_taken: int) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Accepts raw tokens, embeds them, and then calls the existing forward_ppo method.
+    Accepts raw tokens, embeds them, and then calls the existing forward_ppo method. 
+    Will complete one step of the thoughtsformer process depending on n_thoughts_taken. Ideally this is 
+    called iteratively until n_thoughts_taken is equal to max_thought_len, in which case 
+    the output logits can be used for next token prediction 
     
     Args:
     tokens (torch.Tensor): Input tokens of shape (batch_size, seq_len)
@@ -389,29 +294,51 @@ class ThoughtsFormer(nn.Module):
     
     # Call the existing forward_ppo method
     return self.forward_ppo(state_embeddings, padding_mask, n_thoughts_taken)
-  # def forward(self, state_embeddings, padding_mask) -> tuple[torch.Tensor, torch.Tensor]:
-
-  #   # Embeddings should be size N x seq_len x d_embed
-  #   self.token_positions = torch.where(padding_mask == False)[1]
-  #   self.n_real_tokens = int(self.max_context_length - torch.sum(padding_mask))
-
-  #   original_embeddings = state_embeddings
-  #   debug_print("original embeddings \n", state_embeddings, flag=self.debug)
-
-  #   for thoughts_taken in range(self.thought_length+1):
-  #     debug_print(f"initiating loop for thought {thoughts_taken}", flag=self.debug)
-  #     next_embeddings = self.transformer(state_embeddings, padding_mask, thoughts_taken, self.n_real_tokens)
-  #     # next_embeddings = torch.arange(self.seq_len).view(1,-1,1).repeat([embeddings.size(0),1,d_embed])
-  #     debug_print(next_embeddings, next_embeddings.shape, flag=self.debug)
-  #     if thoughts_taken != self.thought_length: # Don't need to insert next thoughts if there's not going to be another iteration
-  #       state_embeddings = self.insert_thoughts(next_embeddings, original_embeddings, padding_mask, thoughts_taken + 1)
-  #     debug_print("updated embeddings\n", state_embeddings,  flag=self.debug)
-
-  #     original_embeddings = state_embeddings
-
-  #   return self.policy_feedforward(state_embeddings), self.value_feedforward(state_embeddings)
+  
+  def entire_thought_generation(self, tokens: torch.Tensor, padding_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    '''
+    Takes in tokens, iteratively adds thoughts to those tokens by predicting the next thought token and sampling from the distribution, then returns the final context with thoughts added along with the logits for the final token predictions.
+    '''
+    tokens = F.pad(tokens, (0,self.max_context_length-tokens.size(1)))
+    def token_batched_reshape_with_offset(x: torch.Tensor, max_seq_length: int, thoughts_taken: int) -> torch.Tensor:
+      thoughts = thoughts_taken + 1
+      max_thoughts = x.size(1) // max_seq_length
+      x = x[:,:max_seq_length*thoughts].view(x.size(0), max_seq_length, thoughts)
+      return F.pad(x,(0, (max_thoughts - thoughts)))
     
+    for thought_iter in range(self.max_thought_length + 1):
+      logits, _ = self.forward_ppo_with_tokens(tokens, padding_mask, thought_iter)
+      sampled_tokens, _ = self._sample_tokens(logits)
+      if thought_iter != self.max_thought_length:
+        tokens = token_batched_reshape_with_offset(tokens.view(1,-1), self.max_sequence_length, thought_iter)
+        tokens[:,:,thought_iter+1] = sampled_tokens
+        # plt.imshow(self.state[0,:10]); plt.show()
+        tokens = tokens.view(1,-1)
+    final_step_logits = logits
+    return tokens, final_step_logits
+   
+   
+   
+  def _sample_tokens(self, logits: torch.Tensor):
+    '''
+    Samples tokens from logits.
+    '''
+    log_probs = F.log_softmax(logits, dim=-1)
+    
+    probs = F.softmax(logits, dim = -1)
+    sampled_tokens = torch.multinomial(
+        probs.view(-1, probs.size(-1)),
+        num_samples=1
+    ).view(-1, probs.size(1))
+    
+    action_probs = log_probs.gather(-1, sampled_tokens.unsqueeze(-1)).squeeze(-1)
+    
+    return sampled_tokens, action_probs
+       
   def prepare_thoughtsformer_embedding_input(self, x: torch.Tensor):
+    '''
+    Internal method. Pads embeddings to full context length.
+    '''
     # Expected shape batch_size, seq_len, d_embed
     # Want to zero pad the seq_len dimension to be max_seq_len + max_seq_len * thought_length
     max_context_length = self.max_context_length
@@ -421,52 +348,19 @@ class ThoughtsFormer(nn.Module):
     
     return F.pad(x, (0,0,0,max_context_length - seq_len))
 
-  def prepare_thoughtsformer_padding_mask_input(self, padding_mask: torch.Tensor):
-      # Expected shape batch_size, seq_len
-      # Want to zero pad the seq_len dimension to be max_seq_len + max_seq_len * thought_length
-      max_context_length = self.max_context_length
+  def _prepare_thoughtsformer_padding_mask_input(self, padding_mask: torch.Tensor) -> torch.Tensor:
+    '''
+    Internal method. Pads the padding mask to full context length.
+    '''
+    # Expected shape batch_size, seq_len
+    # Want to zero pad the seq_len dimension to be max_seq_len + max_seq_len * thought_length
+    max_context_length = self.max_context_length
+  
+    seq_len = padding_mask.size(1) 
+    assert seq_len <= max_context_length, f"Length of the padding mask's ({seq_len}) exceeds maximum context length ({max_context_length}). Sequence length is dimension 1 of the input embeddings."
     
-      seq_len = padding_mask.size(1) 
-      assert seq_len <= max_context_length, f"Length of the padding mask's ({seq_len}) exceeds maximum context length ({max_context_length}). Sequence length is dimension 1 of the input embeddings."
+    return F.pad(padding_mask, (0,max_context_length - seq_len), value=1)
       
-      return F.pad(padding_mask, (0,max_context_length - seq_len), value=1)
-      
-    
-  def insert_thoughts(self, next_embeddings, original_embeddings, padding_mask, iter):
-
-    debug_print("Debugging here ", self.n_real_tokens, self.token_positions.size(0), flag=self.debug)
-    n_elements = self.token_positions.size(0) * iter
-    n_element_next = self.token_positions.size(0) * (iter + 1)
-    batch_size, seq_len, d_embed = original_embeddings.shape
-    # we'll reshape and concat
-    # to go from
-    # 1, t            # 1, t, t
-    # 2, t    --->    # 2, t, t
-    # 3, t.flatten()  # 3, t, t.flatten()
-    
-    # 1 x nrealtokens --> n x n_thoughts
-    # could do 1 x n_tokens --> n x n_max_thoughts
-
-    original_embeddings = original_embeddings[:,:n_elements,:].view(batch_size,-1, iter, d_embed)
-
-
-    # This gets the positions of the next tokens to predict - 1, so right before the tokens that are being predicted
-    next_token_positions = (torch.arange(self.token_positions.size(0)) + 1) * iter - 1
-    next_embeddings = next_embeddings[:, next_token_positions,:]
-
-    # Reshapes the embeddings so they can be concatenated like in the previous diagram
-    next_embeddings = next_embeddings.view(next_embeddings.size(0), next_embeddings.size(1), 1, next_embeddings.size(2))
-
-    #Concatenates and reshapes back
-    final_embeds = torch.cat((original_embeddings,next_embeddings),dim=2)
-    final_embeds = final_embeds.view(batch_size,-1,d_embed)
-    debug_print("final embedding shape", flag=self.debug)
-    debug_print(final_embeds.shape, seq_len, n_element_next, flag=self.debug)
-    padding = torch.zeros(final_embeds.size(0), seq_len-n_element_next, final_embeds.size(2))
-    final_embeds = torch.cat((final_embeds, padding),dim=1)
-
-    return final_embeds
-
   def get_tokens_at_action_location(self, embeddings_or_logits, thought_length):
     n_real_tokens = self.max_context_length // (self.max_thought_length + 1)
     token_predictor_locations = (torch.arange(n_real_tokens) + 1) * (thought_length + 1) - 1

@@ -4,3 +4,7 @@ embeddings.pt
 cpu_training/
 five_layers_thirty_epochs/
 ppo_thoughtsformer2.zip
+5600_timesteps.zip
+archive/
+x.png
+rl_learning.ipynb
