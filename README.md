@@ -17,6 +17,7 @@ Supervised learning was successful, and the reinforcement learning method, while
 ### Supervised Learning
 The model recurrently generates N embeddings for every single token in parallel and passes the final embedding through an output head to recieve the final token. After generating every thought embedding, the model places that embedding back into the context like this.
 
+![image](https://github.com/user-attachments/assets/721076e7-827d-4e24-9a0d-3ac5e4970c45)
 
 Because the existing transformer takes input embeddings and repeatedly transforms them in the embedding space to create an embedding that encodes the necessary information to predict the next token, the ThoughtsFormer aims to allow the model to continue transforming the same embedding more in a recurrent fashion.
 
