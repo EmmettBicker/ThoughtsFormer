@@ -44,7 +44,7 @@ class ThoughtsFormerPolicy(ActorCriticPolicy):
     def forward(self, obs: dict):
         assert 'state' in obs and 'thought_step' in obs, f"'state' and 'thought_step' should be keys of the observation dictionary"
         
-        logits, values = self.model.forward_ppo_with_tokens(obs['state'], torch.zeros_like(obs['state']), obs['thought_step'])
+        logits, values = self.model.forward_rl_tokens(obs['state'], torch.zeros_like(obs['state']), obs['thought_step'])
         sampled_tokens, action_probs = self.sample_tokens(logits)
        
         return sampled_tokens, values, action_probs
@@ -53,7 +53,7 @@ class ThoughtsFormerPolicy(ActorCriticPolicy):
     def forward_with_logits(self, obs: dict):
         assert 'state' in obs and 'thought_step' in obs, f"'state' and 'thought_step' should be keys of the observation dictionary"
         
-        logits, values = self.model.forward_ppo_with_tokens(obs['state'], torch.zeros_like(obs['state']), obs['thought_step'])
+        logits, values = self.model.forward_rl_tokens(obs['state'], torch.zeros_like(obs['state']), obs['thought_step'])
         sampled_tokens, action_probs = self.sample_tokens(logits)
        
         return sampled_tokens, values, action_probs, logits
@@ -99,8 +99,8 @@ class ThoughtsFormerPolicy(ActorCriticPolicy):
 
 
     def _get_action_dist_from_obs(self, obs):
-        return self.model.forward_ppo_with_tokens(obs['state'], torch.zeros_like(obs['state']), obs['thought_step'])[0]
+        return self.model.forward_rl_tokens(obs['state'], torch.zeros_like(obs['state']), obs['thought_step'])[0]
 
     def predict_values(self, obs):
-        return self.model.forward_ppo_with_tokens(obs['state'], torch.zeros_like(obs['state']), obs['thought_step'])[1]
+        return self.model.forward_rl_tokens(obs['state'], torch.zeros_like(obs['state']), obs['thought_step'])[1]
 

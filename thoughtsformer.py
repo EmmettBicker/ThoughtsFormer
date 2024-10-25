@@ -99,24 +99,21 @@ class ThoughtCausalTransformer(nn.Module):
     Generates a causal mask where thoughts are invisible to all other tokens 
     except for tokens later in the same train of thought.
     '''
-    main_size = self.max_context_length
-    block_size = thoughts_taken + 1
-    n_tokens = self.max_context_length // block_size # To get really good debugging where padding tokens are set to 0, remove // block_size
-    
-    # Has ones on the diagonal to avoid nan issues where a value is never attended to
-    causal_mask = torch.eye(main_size)
-    block_for_thought_sequence = torch.triu(torch.ones(block_size,block_size),diagonal=0)
+    sz = self.max_context_length
+    t = thoughts_taken + 1
+    def create_vertical_lines(size, spacing):
+      indices = torch.arange(size)
+      pattern = (indices % spacing != 0).float()
+      lines = pattern.expand(size, -1)
+      return lines
 
-    # List of starting indices for the diagonal blocks
-    block_starting_idxs = torch.arange(n_tokens) * block_size
+    lines= create_vertical_lines(sz,t).bool()
+    blocks = ~torch.block_diag(*torch.ones(sz//t+1,t,t)).bool()[0:sz,0:sz]
+    line_blocks = torch.bitwise_and(lines,blocks)
+    triu = torch.triu(torch.ones(sz,sz), diagonal=1).bool()
+    mask = torch.bitwise_or(line_blocks,triu)
 
-    for idx in block_starting_idxs:
-        causal_mask[idx:idx+block_size, idx:idx+block_size] = block_for_thought_sequence
-        causal_mask[idx, idx+1:n_tokens*block_size] = 1
-
-    causal_mask = causal_mask.T == 0
-
-    return causal_mask
+    return mask
 
   def forward(self, x, padding_mask, thoughts_taken):
     '''
@@ -130,7 +127,8 @@ class ThoughtCausalTransformer(nn.Module):
     if self.debug == True:
       plt.imshow(causal_mask)
       plt.show()
-    x = self.transformer(x, mask=causal_mask, src_key_padding_mask=padding_mask)
+    temp_padding_mask = F.pad(torch.repeat_interleave(padding_mask, repeats=thoughts_taken+1, dim=-1), (0,self.max_context_length-self.max_sequence_length*(thoughts_taken+1)),value=True)
+    x = self.transformer(x, mask=causal_mask, src_key_padding_mask=temp_padding_mask)
     debug_print("embeddings right after transformer forward", x, flag=self.debug)
     return x
 
@@ -147,6 +145,7 @@ class ThoughtsFormer(nn.Module):
                vocab_size: int, 
                max_context_length: int = None,
                max_sequence_length: int = None, 
+               reinforcement_learning: bool = False,
                sinusoidal_position_encoding: bool = False,
                num_layers: int = 8, 
                n_head: int = 8, 
@@ -167,6 +166,7 @@ class ThoughtsFormer(nn.Module):
         vocab_size (int): vocab_size
         max_context_length (int, optional): The maximum context length of the model. Must specify this or specify max_sequence_length because max_sequence_length * (max_thought_len + 1) is equal to max_context_length. Defaults to None.
         max_sequence_length (int, optional): The maximum sequence length of the model. Must specify this or specify max_context_length because max_sequence_length * (max_thought_len + 1) is equal to max_context_length. Defaults to None.
+        reinforcement_learning (bool, optional): Whether to initialize the output heads policy_feedforward and value_feedforward or the head out. Necessary for calling methods like forward_rl_tokens. Defaults to False.
         sinusoidal_position_encoding (bool, optional): Whether or not to use sinusoidal or learned positional encodings. Positional encodings are 2D, for position in thought and position in sequence; thought encodings will always be learned, this parameter specifies if position in sequence tokens are sinusoidal. Defaults to False.
         num_layers (int, optional): Unchanged transformer parameter. Defaults to 8.
         n_head (int, optional): Unchanged transformer parameter. Defaults to 8.
@@ -228,23 +228,50 @@ class ThoughtsFormer(nn.Module):
     #   nn.GELU(),
     #   nn.Linear(d_embed, vocab_size)
     # )
-    
-    self.policy_feedforward = nn.Linear(d_embed, vocab_size,bias=False)
-    # Weird difference between the two but GPT2 uses the single head for the feedforward head and I want to do the weight transfer entirely but allow extra modularity for the value function
-    self.value_feedforward = nn.Sequential(
-      nn.Linear(d_embed, dim_feedforward),
-      nn.GELU(),
-      nn.Linear(dim_feedforward, 1)
-    )
+    if reinforcement_learning:
+      self.policy_feedforward = nn.Linear(d_embed, vocab_size,bias=False)
+      # Weird difference between the two but GPT2 uses the single head for the feedforward head and I want to do the weight transfer entirely but allow extra modularity for the value function
+      self.value_feedforward = nn.Sequential(
+        nn.Linear(d_embed, dim_feedforward),
+        nn.GELU(),
+        nn.Linear(dim_feedforward, 1)
+      )
+    else:
+      self.out = nn.Linear(d_embed, vocab_size)
     self.token_embedding = nn.Embedding(vocab_size, d_embed)
     
     self.debug = verbose
 
-  
-  def forward_ppo(self, state_embeddings: torch.Tensor, padding_mask: torch.Tensor, n_thoughts_taken: int | torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+  def forward(self, tokens: torch.Tensor, padding_mask: torch.Tensor):
     '''
-    Takes in the current state, the padding mask, and the number of thoughts already taken. Outputs the logits for the next action and value for every token in the sequence. 
+    Takes in tokens, iteratively adds thoughts to those tokens by predicting the next thought token and sampling from the distribution, then returns the final context with thoughts added along with the logits for the final token predictions.
     '''
+    assert tokens.size(1) <= self.max_sequence_length # Embeddings passed in are just the first sequence no padding
+    
+    
+    state_embeddings = self.token_embedding(tokens)
+    state_embeddings = self.prepare_thoughtsformer_embedding_input(state_embeddings)
+    padding_mask = self._prepare_thoughtsformer_padding_mask_input(padding_mask)
+    
+    from dual_positional_encoding import simple_batched_reshape_with_offset, inverse_simple_batched_reshape_with_offset
+    for thought_iter in range(self.max_thought_length + 1):
+      selected_next_embeddings = self.get_tokens_at_action_location(
+            self.forward_embeddings(state_embeddings, padding_mask, thought_iter), thought_iter
+      )
+      if thought_iter != self.max_thought_length:
+        state_embeddings = simple_batched_reshape_with_offset(state_embeddings, self.max_sequence_length, thought_iter)
+        state_embeddings[:,:,thought_iter+1, :] = selected_next_embeddings
+        # plt.imshow(self.state[0,:10]); plt.show()
+        state_embeddings = inverse_simple_batched_reshape_with_offset(state_embeddings, thought_iter+1)
+        
+        
+     
+    logits = self.out(selected_next_embeddings)
+
+    return logits
+   
+
+  def forward_embeddings(self, state_embeddings: torch.Tensor, padding_mask: torch.Tensor, n_thoughts_taken: int | torch.Tensor) -> torch.Tensor:
     if type(n_thoughts_taken) == torch.Tensor and n_thoughts_taken.numel() == 1:
       n_thoughts_taken: int  = n_thoughts_taken.item()
        
@@ -263,14 +290,22 @@ class ThoughtsFormer(nn.Module):
 
     next_embeddings = self.transformer(state_embeddings, padding_mask, n_thoughts_taken)
     debug_print("future embeddings\n", next_embeddings,  flag=self.debug)
+    
+    return next_embeddings
+  
+  def forward_rl_embeddings(self, state_embeddings: torch.Tensor, padding_mask: torch.Tensor, n_thoughts_taken: int | torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    '''
+    Takes in the current state, the padding mask, and the number of thoughts already taken. Outputs the logits for the next action and value for every token in the sequence. 
+    '''
+    next_embeddings = self.forward_embeddings(state_embeddings, padding_mask, n_thoughts_taken)
     action_embeddings = self.get_tokens_at_action_location(next_embeddings, n_thoughts_taken)
     
     return self.policy_feedforward(action_embeddings), self.value_feedforward(action_embeddings).squeeze(dim=2)
     
   # Claude's version for tokens!
-  def forward_ppo_with_tokens(self, tokens: torch.Tensor, padding_mask: torch.Tensor, n_thoughts_taken: int) -> tuple[torch.Tensor, torch.Tensor]:
+  def forward_rl_tokens(self, tokens: torch.Tensor, padding_mask: torch.Tensor, n_thoughts_taken: int) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Accepts raw tokens, embeds them, and then calls the existing forward_ppo method. 
+    Accepts raw tokens, embeds them, and then calls the existing forward_rl_embeddings method. 
     Will complete one step of the thoughtsformer process depending on n_thoughts_taken. Ideally this is 
     called iteratively until n_thoughts_taken is equal to max_thought_len, in which case 
     the output logits can be used for next token prediction 
@@ -292,8 +327,8 @@ class ThoughtsFormer(nn.Module):
     # Embed the tokens
     state_embeddings = self.token_embedding(tokens)
     
-    # Call the existing forward_ppo method
-    return self.forward_ppo(state_embeddings, padding_mask, n_thoughts_taken)
+    # Call the existing forward_rl_embeddings method
+    return self.forward_rl_embeddings(state_embeddings, padding_mask, n_thoughts_taken)
   
   def entire_thought_generation(self, tokens: torch.Tensor, padding_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     '''
@@ -307,7 +342,7 @@ class ThoughtsFormer(nn.Module):
       return F.pad(x,(0, (max_thoughts - thoughts)))
     
     for thought_iter in range(self.max_thought_length + 1):
-      logits, _ = self.forward_ppo_with_tokens(tokens, padding_mask, thought_iter)
+      logits, _ = self.forward_rl_tokens(tokens, padding_mask, thought_iter)
       sampled_tokens, _ = self._sample_tokens(logits)
       if thought_iter != self.max_thought_length:
         tokens = token_batched_reshape_with_offset(tokens.view(1,-1), self.max_sequence_length, thought_iter)
@@ -354,16 +389,19 @@ class ThoughtsFormer(nn.Module):
     '''
     # Expected shape batch_size, seq_len
     # Want to zero pad the seq_len dimension to be max_seq_len + max_seq_len * thought_length
-    max_context_length = self.max_context_length
+    max_sequence_length = self.max_sequence_length
   
     seq_len = padding_mask.size(1) 
-    assert seq_len <= max_context_length, f"Length of the padding mask's ({seq_len}) exceeds maximum context length ({max_context_length}). Sequence length is dimension 1 of the input embeddings."
+    assert seq_len <= max_sequence_length, f"Length of the padding mask's ({seq_len}) exceeds maximum sequence length ({max_sequence_length}). Sequence length is dimension 1 of the input embeddings."
     
-    return F.pad(padding_mask, (0,max_context_length - seq_len), value=1)
+    return F.pad(padding_mask, (0,max_sequence_length - seq_len), value=1)
       
-  def get_tokens_at_action_location(self, embeddings_or_logits, thought_length):
+  def get_tokens_at_action_location(self, embeddings_or_logits: torch.Tensor, thought_length: int) -> torch.Tensor:
     n_real_tokens = self.max_context_length // (self.max_thought_length + 1)
-    token_predictor_locations = (torch.arange(n_real_tokens) + 1) * (thought_length + 1) - 1
+    if isinstance(thought_length, torch.Tensor):
+      token_predictor_locations = (torch.arange(n_real_tokens).to(thought_length.device) + 1) * (thought_length + 1) - 1
+    else:
+      token_predictor_locations = (torch.arange(n_real_tokens) + 1) * (thought_length + 1) - 1
     # print(logits)
     # print(token_predictor_locations)
     return embeddings_or_logits[:,token_predictor_locations,:]
@@ -394,7 +432,7 @@ class ThoughtsFormer(nn.Module):
     return token_positions + torch.arange(self.token_positions.shape[0])
   
   @classmethod
-  def from_pretrained_GPT2(cls: Type['ThoughtsFormer'], n_thoughts: int = 0) -> 'ThoughtsFormer':
+  def from_pretrained_GPT2(cls: Type['ThoughtsFormer'], n_thoughts: int = 0, reinforcement_learning: bool = False) -> 'ThoughtsFormer':
     from transformers import GPT2LMHeadModel
     pretrained = GPT2LMHeadModel.from_pretrained("gpt2")
     
@@ -403,6 +441,7 @@ class ThoughtsFormer(nn.Module):
       max_thought_len=n_thoughts,
       vocab_size=50257,
       max_context_length=1024,
+      reinforcement_learning=reinforcement_learning,
       sinusoidal_position_encoding=False,
       num_layers=12,
       n_head=12,
@@ -417,11 +456,15 @@ class ThoughtsFormer(nn.Module):
 
     explicit_map = {
         'token_embedding.weight' : 'transformer.wte.weight',
-        'policy_feedforward.weight' : 'lm_head.weight',
         'transformer.transformer.norm.weight' : 'transformer.ln_f.weight',
         'transformer.transformer.norm.bias' : 'transformer.ln_f.bias',
         'transformer.dual_positional_encoding.learned_positional_encoding.weight' : 'transformer.wpe.weight'
     }
+
+    if reinforcement_learning:
+      explicit_map['policy_feedforward.weight'] = 'lm_head.weight'
+    else:
+      explicit_map['out.weight'] = 'lm_head.weight'
 
     for k, v in explicit_map.items():
         # print(k,v)
