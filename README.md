@@ -29,7 +29,7 @@ A token-based implementation of PPO was created to train this model. The reward 
 
 ## Upcoming updates
 
-This model was just updated to 0.2 with the introduction of supervised learning! Next up is BPTTWT (Back-Propogation Through Time Without Time)
+This model was just updated to include supervised learning! Next up is BPTTWT (Back-Propogation Through Time Without Time)
 
 BPTT with this context has at least quadratic scaling (because it has N thoughts per token to backpropagate and takes N timesteps to generate the sequence), but because of the causal nature of the model, the entire generation process is recreated every step of the computation because existing tokens don't percieve any difference in their computation. This means that 1) the outputs of these layers could be cached allowing a the model to never recompute hidden states (only works on small models) and 2) memory consumption is reduced from quadratic to linear because BPTT doesn't have to go through time as the entire process already exists in the final pass. This is my next area of exploration.
 
