@@ -27,6 +27,14 @@ A token-based implementation of PPO was created to train this model. The reward 
 
 ![image](https://github.com/user-attachments/assets/488c343d-8fcd-4ac5-a2e8-13344b33c523)
 
+## Results
+
+Currently, the model still performs at roughly the same level as a transformer. I'm working on some improvements that will potentially improve the architecture, but even if it isn't better than a Transformer, that's a really interesting takeaway about parameter efficiency. 
+
+![image](https://github.com/user-attachments/assets/7754ef7b-10c7-47f1-af3a-cca123f488d0)
+![image](https://github.com/user-attachments/assets/7f8add5b-4ae8-4275-94c0-e32772e5c9ba)
+
+
 ## Upcoming updates
 
 This model was just updated to include supervised learning! Next up is BPTTWT (Back-Propogation Through Time Without Time)
