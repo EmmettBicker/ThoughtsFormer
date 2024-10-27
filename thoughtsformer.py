@@ -238,11 +238,12 @@ class ThoughtsFormer(nn.Module):
       )
     else:
       self.out = nn.Linear(d_embed, vocab_size)
+      
     self.token_embedding = nn.Embedding(vocab_size, d_embed)
-    
+    self.tau = 0.5 # for gumbel softmax
     self.debug = verbose
 
-  def forward(self, tokens: torch.Tensor, padding_mask: torch.Tensor):
+  def forward(self, tokens: torch.Tensor, padding_mask: torch.Tensor, use_gumbel: bool = True) -> torch.Tensor:
     '''
     Takes in tokens, iteratively adds thoughts to those tokens by predicting the next thought token and sampling from the distribution, then returns the final context with thoughts added along with the logits for the final token predictions.
     '''
@@ -253,12 +254,21 @@ class ThoughtsFormer(nn.Module):
     state_embeddings = self.prepare_thoughtsformer_embedding_input(state_embeddings)
     padding_mask = self._prepare_thoughtsformer_padding_mask_input(padding_mask)
     
+    debug_tokens = torch.zeros_like(state_embeddings[:,:,0])
+    debug_tokens[:, :self.max_sequence_length] = tokens
+    
     from dual_positional_encoding import simple_batched_reshape_with_offset, inverse_simple_batched_reshape_with_offset
     for thought_iter in range(self.max_thought_length + 1):
       selected_next_embeddings = self.get_tokens_at_action_location(
             self.forward_embeddings(state_embeddings, padding_mask, thought_iter), thought_iter
       )
       if thought_iter != self.max_thought_length:
+        if use_gumbel:
+          selected_next_embeddings, selected_tokens = self.gumbel_calculation(selected_next_embeddings)
+          # debug steps
+          debug_tokens = token_batched_reshape_with_offset(debug_tokens, self.max_sequence_length, thought_iter)
+          debug_tokens[:,:,thought_iter+1] = selected_tokens
+          debug_tokens = token_inverse_simple_batched_reshape_with_offset(debug_tokens, thought_iter+1)
         state_embeddings = simple_batched_reshape_with_offset(state_embeddings, self.max_sequence_length, thought_iter)
         state_embeddings[:,:,thought_iter+1, :] = selected_next_embeddings
         # plt.imshow(self.state[0,:10]); plt.show()
@@ -269,6 +279,18 @@ class ThoughtsFormer(nn.Module):
     logits = self.out(selected_next_embeddings)
 
     return logits
+  
+  def gumbel_calculation(self, selected_next_embeddings: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    next_token_logits = self.out(selected_next_embeddings)
+    if self.training:
+      self.tau = max(self.tau * 0.999, 0.1)
+      selected = F.gumbel_softmax(next_token_logits, tau=self.tau, hard=True)
+      selected_tokens = selected.argmax(dim=-1)
+      return selected @ self.token_embedding.weight, selected_tokens
+    else:
+      index = next_token_logits.argmax(dim=-1)
+      return self.token_embedding(index), index
+  
    
 
   def forward_embeddings(self, state_embeddings: torch.Tensor, padding_mask: torch.Tensor, n_thoughts_taken: int | torch.Tensor) -> torch.Tensor:
@@ -335,12 +357,7 @@ class ThoughtsFormer(nn.Module):
     Takes in tokens, iteratively adds thoughts to those tokens by predicting the next thought token and sampling from the distribution, then returns the final context with thoughts added along with the logits for the final token predictions.
     '''
     tokens = F.pad(tokens, (0,self.max_context_length-tokens.size(1)))
-    def token_batched_reshape_with_offset(x: torch.Tensor, max_seq_length: int, thoughts_taken: int) -> torch.Tensor:
-      thoughts = thoughts_taken + 1
-      max_thoughts = x.size(1) // max_seq_length
-      x = x[:,:max_seq_length*thoughts].view(x.size(0), max_seq_length, thoughts)
-      return F.pad(x,(0, (max_thoughts - thoughts)))
-    
+
     for thought_iter in range(self.max_thought_length + 1):
       logits, _ = self.forward_rl_tokens(tokens, padding_mask, thought_iter)
       sampled_tokens, _ = self._sample_tokens(logits)
@@ -507,3 +524,15 @@ class ThoughtsFormer(nn.Module):
     thoughtsformer.load_state_dict(t_dict)
     return thoughtsformer
     
+    
+def token_batched_reshape_with_offset(x: torch.Tensor, max_seq_length: int, thoughts_taken: int) -> torch.Tensor:
+  thoughts = thoughts_taken + 1
+  max_thoughts = x.size(1) // max_seq_length
+  x = x[:,:max_seq_length*thoughts].view(x.size(0), max_seq_length, thoughts)
+  return F.pad(x,(0, (max_thoughts - thoughts)))
+
+def token_inverse_simple_batched_reshape_with_offset(x: torch.Tensor, thoughts_taken: int) -> torch.Tensor:
+  seq_len, max_thoughts = x.size(1), x.size(2)
+  x = x[:,:,:thoughts_taken+1].reshape(x.size(0), -1)
+  x = F.pad(x,(0, seq_len * (max_thoughts - (thoughts_taken+1))))
+  return x
