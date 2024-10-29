@@ -73,6 +73,6 @@ class ThoughtsFormer(nn.Module):
                 _x[:,s::(step+2)] = x[:, s::(step+1)]
             # Add the embeddings that were just generated
             _x[:,step+1::(step+2)] = next[:, step::(step+1)]
-            x = _x  
+            x = _x
         # Return embeddings that were generated at the final step 
         return self.output(x[:,step+1::(step+2)])
