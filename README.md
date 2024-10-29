@@ -18,6 +18,13 @@ The model recurrently generates N embeddings for every single token in parallel 
 This work is an extension of the Universal Transformer with an added output at every step that aims to serve as a thought, or a piece of information that the model remembers and use at every subsequent thought step. 
 ## Results
 
+The model learns a more complex understanding of the data than the universal transformers model. Here's the results on question answering with the bAbI training dataset.
+
+![Untitled-3](https://github.com/user-attachments/assets/a8f64c2f-0a5d-4f5c-a529-c03fee410168)
+
+I've also tested applying it to language modelling, and it performs slightly better than transformers and universal transformers, but language modelling doesn't seem to recieve significant benefits from recurrent-in-depth models.
+![Untitled-1](https://github.com/user-attachments/assets/22d9b463-1952-4edb-9138-f2c5f19585d9)
+
 
 ## Upcoming updates
 
