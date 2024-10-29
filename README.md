@@ -18,13 +18,6 @@ The model recurrently generates N embeddings for every single token in parallel 
 This work is an extension of the Universal Transformer with an added output at every step that aims to serve as a thought, or a piece of information that the model remembers and use at every subsequent thought step. 
 ## Results
 
-<<<<<<< Updated upstream
-I'm currently running tests. Here's an interesting accuracy chart comparing a regular transformer, the ThoughtsFormer, and the universal transformer on bAbI question answering.
-![Untitled-1](https://github.com/user-attachments/assets/b8f8566f-7b14-49e7-8a84-c3ceed926679)
-
-=======
->>>>>>> Stashed changes
-
 
 ## Upcoming updates
 
