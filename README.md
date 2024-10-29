@@ -1,6 +1,6 @@
 # ThoughtsFormer
-The ThoughtsFormer is a model that outputs multiple "thought" tokens before predicting its next action. 
-In this repository, it is trained on next-token prediction. To predict one token, the thoughtsformer recurrently generates X thought tokens, and on the final token it generates what it believes is the correct token which acts as a reward for the model.
+The ThoughtsFormer is a model that outputs multiple "thought" embeddings before predicting its next action. 
+In this repository, it is trained on next-token prediction. To predict one token, the thoughtsformer recurrently generates X thought embeddings, and the final embedding is passed through an output head to predict the answer.
 
 ## Causal Masking (only for causal problems, uses no causal mask for bAbI)
 To ensure generated thought-tokens don't impact other trains of thought, an interesting causal method is applied, as is shown below.
