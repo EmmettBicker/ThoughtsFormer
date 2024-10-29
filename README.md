@@ -20,7 +20,8 @@ This work is an extension of the Universal Transformer with an added output at e
 
 The model learns a more complex understanding of the data than the universal transformers model. Here's the results on question answering with the bAbI training dataset.
 
-![Untitled-3](https://github.com/user-attachments/assets/a8f64c2f-0a5d-4f5c-a529-c03fee410168)
+![Untitled-1](https://github.com/user-attachments/assets/c050f8a0-0892-4f79-862c-6da88108bee1)
+
 
 I've also tested applying it to language modelling, and it performs slightly better than transformers and universal transformers, but language modelling doesn't seem to receive significant benefits from recurrent-in-depth models.
 ![image](https://github.com/user-attachments/assets/8b0b89cb-81fc-42d2-b67d-5a068eeb8c8f)
